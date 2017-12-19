@@ -1,0 +1,6 @@
+eclipse.preferences.version=1
+encoding//services/AppConfig.py=utf-8
+encoding//services/OCRUtils.py=utf-8
+encoding//services/StartOCR.py=utf-8
+encoding//services/VPARManager.py=utf-8
+encoding//services/wsgi.py=utf-8

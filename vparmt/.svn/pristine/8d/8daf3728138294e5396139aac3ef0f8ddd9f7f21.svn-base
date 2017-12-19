@@ -1,0 +1,309 @@
+#include "vparmt.h"
+#include <iostream>
+#include <pthread.h>
+#include <time.h>
+#include <string.h>
+#include <cstring>
+#include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <queue>
+#include <string>
+#include <time.h>
+#include <iostream>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define IS_TESTING true
+#define NANO_SECOND_MULTIPLIER 1000000  //1 millisecond = 1,000,000 Nanoseconds
+const long INTERVAL_MS = 100 * NANO_SECOND_MULTIPLIER;
+
+#if IS_TESTING
+const char IMG_BASE_PATH_IN[] = "/opt/vpar/workimg/in";
+//"/opt/vpar/sampleimg";
+//"/opt/vpar/workimg/in";
+#else
+const char IMG_BASE_PATH_IN[] = "/opt/vpar/workimg/in";
+#endif
+const char IMG_BASE_PATH_OUT[] = "/opt/vpar/workimg/out";
+
+const int MAX_QUEUE_SIZE = 30;
+
+const long TEST_COUNTRY_CODE = 101;
+const long BRAZIL_COUNTRY_CODE = 203;
+
+typedef long (*fvparmtInit)(callbackRes call, long lCountryCode, long lAvCharacterHeight, bool bDuplicateLines, bool bSort2LinesPLates,bool bTrucks,bool Trace);
+typedef void (*fvparmtEnd)();
+typedef long (*fvparmtQueueSize)();
+
+typedef long (*fvparmtRead)(tRecognitionEngineSettings *Configuracion, long lWidth, long lHeight, unsigned char* pbImageData);
+typedef long (*fvparmtReadRGB24)(tRecognitionEngineSettings *Configuracion, long lWidth, long lHeight, unsigned char* pbImageDataRGB,bool bFlip );
+typedef long (*fvparmtReadRGB32)(tRecognitionEngineSettings *Configuracion, long lWidth, long lHeight, unsigned char* pbImageDataRGB,bool bFlip );
+typedef long (*fvparmtReadBMP)(tRecognitionEngineSettings *Configuracion, char* pcFilename);
+typedef long (*fvparmtReadJPG)(tRecognitionEngineSettings *Configuracion, char* pcFilename);
+
+//Estrutura para o arquivo de entrada
+typedef struct {
+	char fileId[15];
+	char imgFile[100];
+} OcrInInfo;
+
+//Armazena os binarios dos arquivos já em formato BMP para processamento pelo OCR.
+void* pendingImgFiles[MAX_QUEUE_SIZE];
+//Marca a posição do pendingImgFiles onde está o próximo arquivo a ser processado.
+int filesQueueIndex = 0;
+
+void* hVPARMTlib;
+fvparmtInit pVPARMTInit;
+fvparmtEnd pVPARMTEnd;
+fvparmtQueueSize pVPARMTQueueSize;
+fvparmtRead pVPARMTRead;
+fvparmtReadRGB24 pVPARMTReadRGB24;
+fvparmtReadRGB32 pVPARMTReadRGB32;
+fvparmtReadBMP pVPARMTReadBMP;
+fvparmtReadJPG pVPARMTReadJPG;
+
+long callbackReadyResult(long id, tResults* result);
+void PrepararConfiguracion(tRecognitionEngineSettings &configuracion);
+OcrInInfo* getNextImgFile();
+
+/*
+ * Thread q le os arquivos de imagem e transforma para o formato BMP,
+ * mantendo em memoria para processamento.
+ */
+void *threadFileReader(void* param) {
+	DIR *d;
+	struct dirent *dir;
+	int i = 0; //contador de arquivos no array pendingImgFiles
+	while(1) {
+//		if(i >= MAX_PENDING_IMG_FILES_QUEUE_SIZE)
+//			continue;
+		d = opendir(IMG_BASE_PATH_IN);
+		if (d) {
+			while ((dir = readdir(d)) != NULL)
+			{
+				 printf("%s\n", dir->d_name);
+				 //TODO linkar a livraria dwebp a essa aplicacao e armazenar os byte[] da imagem decodificada em memoria.
+				 //pthread_mutex_lock( &mutex_read );
+				 //pendingImgFiles
+			}
+
+			closedir(d);
+		}
+	}
+	return(0);
+}
+
+void *threadOCRProcessor(void* param)
+{
+    tRecognitionEngineSettings configuracion;
+	PrepararConfiguracion(configuracion);
+	timespec sleepValue = {0};
+	sleepValue.tv_nsec = INTERVAL_MS;
+
+	while(true)
+	{
+		long qsize = pVPARMTQueueSize();
+#if IS_TESTING
+		printf("* Queue size: %d *\n", qsize);
+#endif
+
+		if (qsize < MAX_QUEUE_SIZE)
+		{
+			OcrInInfo* ocrInInfo = getNextImgFile();
+			if(ocrInInfo == NULL) {
+#if IS_TESTING
+				if(ocrInInfo == NULL) {
+					printf("* No file, let's sleep...\n");
+					sleep(3);
+				}
+#endif
+				nanosleep(&sleepValue, NULL);
+				continue;
+			}
+			configuracion.lUserParam1 = ocrInInfo; //a memória da estrutura deve ser liberada posteriormente
+			pVPARMTReadBMP(&configuracion, ocrInInfo->imgFile);
+		}
+		else {
+			printf("*** full queue ***\n");
+#if IS_TESTING
+			sleep(3);
+#endif
+		}
+	}
+
+    return 0;
+}
+
+//****************** Utilitarios para arquivos
+bool isRegularFile(const char* dir, const char* file) {
+	struct stat st;
+	char filename[100];
+	snprintf(filename, sizeof(filename), "%s/%s", dir, file);
+	stat(filename, &st);
+	return S_ISREG(st.st_mode);
+}
+
+/*
+ * Renomeia arquivos em processamento
+ */
+void renameV(OcrInInfo* processingFileInfo, const char* dir, const char* fName) {
+	char imgFileTmp[100];
+	sprintf(imgFileTmp, "%s/%s", dir, fName);
+	sprintf(processingFileInfo->fileId, "%s", fName);
+	sprintf(processingFileInfo->imgFile, "%s/v%s", dir, fName);
+	rename(imgFileTmp, processingFileInfo->imgFile);
+}
+
+/*
+ * Verifica se o arquivo tem extensao webp e converte a imagem.
+ * O arquivo webp é REMOVIDO.
+ */
+void preprocessFile(OcrInInfo* processingFileInfo, const char* dir, const char* fName) {
+	if(strlen(fName) < 5) //Nome menor q o tamanho de ".webp"
+		return renameV(processingFileInfo, IMG_BASE_PATH_IN, fName);
+
+	//verifica se tem extensao webp
+	char substr[6];
+	memcpy(substr, &fName[strlen(fName)-5], 5);
+	substr[5] = '\0';
+	if(strcasecmp(substr, ".WEBP")) //se nao é webp, apenas renomeia.
+		return renameV(processingFileInfo, IMG_BASE_PATH_IN, fName);
+
+	char webpFileName[50];
+	sprintf(webpFileName, "%s/%s", dir, fName); //nome completo do arquivo webp
+	strncpy(processingFileInfo->fileId, fName, strlen(fName)-5);
+	sprintf(processingFileInfo->imgFile, "%s/v%.*s", dir, strlen(fName)-5, fName); //nome do arquivo de saida para processamento.
+	char command[100];
+	sprintf(command, "/opt/webp/bin/dwebp %s -o %s", webpFileName, processingFileInfo->imgFile);
+	system(command);
+	remove(webpFileName);
+}
+//********************************************
+
+/*
+ * Procura no diretório padrão por imagens ainda não analisadas.
+ */
+OcrInInfo* getNextImgFile() {
+	static DIR *d = NULL;
+	struct dirent *dir = NULL;
+	OcrInInfo* ocrInInfo = NULL;
+	bool newFileProcessed = true; //controla se algum arquivo novo foi processado em uma abertura de diretório.
+
+	do { //le o diretorio até encontrar um arquivo a ser processado.
+		if(dir == NULL) {
+			closedir(d);
+			d = opendir(IMG_BASE_PATH_IN);
+			newFileProcessed = false;
+		}
+		while(((dir = readdir(d)) != NULL) &&
+				( !isRegularFile(IMG_BASE_PATH_IN, dir->d_name) || //verifica se é um arquivo regular.
+				(dir->d_name[0] == 'v') ) //desconsidera os arquivos renomeados, q estao em processamento.
+			);
+		if(dir != NULL) {
+			newFileProcessed = true;
+			ocrInInfo = (OcrInInfo*)malloc(sizeof(OcrInInfo)); //memória liberada posteriomente na função de callback.
+			preprocessFile(ocrInInfo, IMG_BASE_PATH_IN, dir->d_name);
+			break;
+		}
+	} while(newFileProcessed);
+
+	return ocrInInfo;
+}
+
+int initVPAR() {
+	hVPARMTlib = dlopen("vparmt.so",RTLD_LAZY);
+
+    pVPARMTInit = (fvparmtInit)dlsym(hVPARMTlib, "vparmtInit");
+    pVPARMTEnd = (fvparmtEnd)dlsym(hVPARMTlib, "vparmtEnd");
+    pVPARMTRead = (fvparmtRead)dlsym(hVPARMTlib, "vparmtRead");
+	pVPARMTReadRGB24 = (fvparmtReadRGB24)dlsym(hVPARMTlib, "vparmtReadRGB24");
+	pVPARMTReadRGB32 = (fvparmtReadRGB32)dlsym(hVPARMTlib, "vparmtReadRGB32");
+	pVPARMTReadBMP = (fvparmtReadBMP)dlsym(hVPARMTlib, "vparmtReadBMP");
+	pVPARMTReadJPG = (fvparmtReadJPG)dlsym(hVPARMTlib, "vparmtReadJPG");
+	pVPARMTQueueSize = (fvparmtQueueSize)dlsym(hVPARMTlib, "vparmtQueueSize");
+
+	printf("Init library...\n");
+	printf("Country code: %d\n", IS_TESTING? TEST_COUNTRY_CODE: BRAZIL_COUNTRY_CODE);
+
+    return pVPARMTInit(callbackReadyResult, IS_TESTING? TEST_COUNTRY_CODE: BRAZIL_COUNTRY_CODE,-1, false, false, false, false);
+}
+
+int main(int argc, char* argv[])
+{
+	if(!initVPAR()) {
+		printf("ERROR: Problem when initializing VPAR.\n");
+		return 1;
+	}
+	printf("Init OK\n");
+
+	//limpa os arquivos v.
+	system("find /opt/vpar/workimg/in/ -type f -name v\\* -exec rm {} \\;");
+
+	pthread_t handleOCRProcessor;
+	pthread_create(&handleOCRProcessor, NULL, threadOCRProcessor, NULL);
+	pthread_join(handleOCRProcessor, NULL);
+	pVPARMTEnd();
+
+	return 0;
+}
+
+/*
+ * Função de callback, chamada pela engine após realizar o OCR.
+ */
+long callbackReadyResult(long identificador, tResults* resultados) {
+	OcrInInfo* ocrInInfo = (OcrInInfo*)resultados->lUserParam1;
+	if ((resultados->lRes == 1) && (resultados->lNumberOfPlates > 0))
+	{
+#if IS_TESTING
+		printf("Placa id %d: %s. tempo: %d\n", identificador, resultados->strResult[0], resultados->lProcessingTime);
+#endif
+		char outFileName[80];
+		sprintf(outFileName, "%s/%s", IMG_BASE_PATH_OUT, ocrInInfo->fileId);
+		FILE* fp = fopen(outFileName, "w");
+		if(!fp) {
+			printf("Output file error for ID: %d and file name: %s\n", identificador, ocrInInfo->fileId);
+			return 1;
+		}
+		fprintf(fp, "%s\n%d\n", resultados->strResult[0], resultados->lProcessingTime);
+		fclose(fp);
+	}
+	else
+	{
+		printf("Nenhum resultado para o id %d\n", identificador);
+	}
+	remove(ocrInInfo->imgFile);
+	free(ocrInInfo);
+	return 0;
+}
+
+void PrepararConfiguracion(tRecognitionEngineSettings &configuracion)
+{
+	configuracion.lMiliseconds = 0;
+	configuracion.bAplicarCorreccion = false;
+	configuracion.fDistance = 0;
+	configuracion.fVerticalCoeff = 0;
+	configuracion.fHorizontalCoeff = 0;
+	configuracion.fAngle = 0;
+	configuracion.fRadialCoeff = 0;
+	configuracion.fVerticalSkew =0;
+	configuracion.fHorizontalSkew =0;
+	configuracion.lNumSteps=0;
+	configuracion.vlSteps[0] = 20;
+	configuracion.vlSteps[1] = 60;
+	configuracion.vlSteps[2] = 35;
+	configuracion.vlSteps[3] = 40;
+	configuracion.vlSteps[4] = 45;
+	configuracion.vlSteps[5] = 50;
+	configuracion.vlSteps[6] = 55;
+	configuracion.vlSteps[7] = 60;
+	configuracion.lLeft = 0;
+	configuracion.lTop = 0;
+	configuracion.lWidth = 0;
+	configuracion.lHeight = 0;
+	configuracion.fScale=1;
+	configuracion.CharacterRectangle = false;
+	configuracion.SlantDetection = 1;
+	configuracion.KillerShadow= 0;
+}

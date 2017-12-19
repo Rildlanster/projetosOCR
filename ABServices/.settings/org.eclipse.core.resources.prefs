@@ -1,0 +1,9 @@
+eclipse.preferences.version=1
+encoding//ABServices/AppConfig.py=utf-8
+encoding//ABServices/CSVStore/CSVManager.py=utf-8
+encoding//ABServices/CSVStore/PassagensStorage.py=utf-8
+encoding//ABServices/StartApp.py=utf-8
+encoding//ABServices/Utils.py=utf-8
+encoding//ABServices/op/PassagensCSVTest.py=utf-8
+encoding//ABServices/op/queryMpirImageLP.py=utf-8
+encoding//ABServices/wsgi.py=utf-8
